@@ -1,0 +1,1 @@
+/var/home/plarpoon/Workspace/factorio-server-manager/target/debug/factorio-server-manager: /var/home/plarpoon/Workspace/factorio-server-manager/src/check_update.rs /var/home/plarpoon/Workspace/factorio-server-manager/src/main.rs
