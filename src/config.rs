@@ -6,6 +6,11 @@ use toml::{Value, map::Map};
 use tracing::{debug, info, warn};
 
 const ALLOWED_KEYS: &[&str] = &["username", "token"];
+const ALLOWED_MOD_MANAGER_KEYS: &[&str] = &[
+    "autoupdate-mods",
+    "autoupdate-server",
+    "autostart-when-finished",
+];
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct FactorioConfig {
@@ -14,16 +19,33 @@ pub struct FactorioConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct ModManagerConfig {
+    #[serde(rename = "autoupdate-mods")]
+    pub autoupdate_mods: bool,
+    #[serde(rename = "autoupdate-server")]
+    pub autoupdate_server: bool,
+    #[serde(rename = "autostart-when-finished")]
+    pub autostart_when_finished: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
     pub factorio: FactorioConfig,
+    #[serde(rename = "mod-manager")]
+    pub mod_manager: ModManagerConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             factorio: FactorioConfig {
-                username: "XXX".into(),
-                token: "XXX".into(),
+                username: "my-username".into(),
+                token: "my-token".into(),
+            },
+            mod_manager: ModManagerConfig {
+                autoupdate_mods: true,
+                autoupdate_server: true,
+                autostart_when_finished: true,
             },
         }
     }
@@ -62,6 +84,7 @@ async fn sanitize_existing(path: &Path) -> Result<Config> {
         .ok_or_else(|| eyre!("Expected root table in {:?}, overwriting", path))?;
 
     sanitize_factorio_section(table);
+    sanitize_mod_manager_section(table);
 
     let new_toml = toml::to_string_pretty(&doc)?;
     fs::write(path, new_toml.clone()).await?;
@@ -104,6 +127,45 @@ fn sanitize_factorio_section(root: &mut Map<String, Value>) {
     } else {
         warn!(
             "'factorio' was not a table (got {:?}), resetting to default",
+            entry
+        );
+        *entry = default_section;
+    }
+}
+
+fn sanitize_mod_manager_section(root: &mut Map<String, Value>) {
+    // Prepare a default ModManagerConfig as TOML Value
+    let default_section: Value = toml::from_str(
+        &toml::to_string(&Config::default().mod_manager)
+            .expect("default mod-manager always serializes"),
+    )
+    .expect("default mod-manager always deserializes");
+
+    // Ensure we have a table under "mod-manager"
+    let entry = root
+        .entry("mod-manager")
+        .or_insert_with(|| default_section.clone());
+
+    if let Value::Table(map) = entry {
+        // Remove any keys not in our allow-list
+        for key in map.keys().cloned().collect::<Vec<_>>() {
+            if !ALLOWED_MOD_MANAGER_KEYS.contains(&key.as_str()) {
+                debug!("Removing disallowed key '{}' from mod-manager config", key);
+                map.remove(&key);
+            }
+        }
+        // Ensure all mod-manager keys exist
+        for &key in ALLOWED_MOD_MANAGER_KEYS {
+            if !map.contains_key(key) {
+                warn!("Missing '{}' in mod-manager config, inserting default", key);
+                if let Some(default_val) = default_section.get(key) {
+                    map.insert(key.into(), default_val.clone());
+                }
+            }
+        }
+    } else {
+        warn!(
+            "'mod-manager' was not a table (got {:?}), resetting to default",
             entry
         );
         *entry = default_section;
