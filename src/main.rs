@@ -1,16 +1,21 @@
 use color_eyre::eyre::Result;
 use osc8::Hyperlink;
 use std::path::Path;
+use tracing::info;
 
 mod config;
+mod logging;
 mod updater;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    logging::init("info");
+    info!("Starting factorio mod manager");
+
     color_eyre::install()?;
 
     // Load or initialize the config file mod-manager.toml
-    let cfg = config::load_or_init(std::path::Path::new("mod-manager.toml")).await?;
+    let cfg = config::load_or_init(Path::new("mod-manager.toml")).await?;
 
     if cfg.factorio.username == "XXX" || cfg.factorio.token == "XXX" {
         eprintln!("Please edit mod-manager.toml to set your Factorio username and token.");
@@ -50,5 +55,7 @@ async fn main() -> Result<()> {
 
     // Dispatch the async updater
     updater::check_update::check_mod_updates(data_dir, &cfg).await?;
+
+    info!("Shutting down");
     Ok(())
 }
