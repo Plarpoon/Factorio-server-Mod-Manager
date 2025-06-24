@@ -1,6 +1,7 @@
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, bail, eyre};
 use osc8::Hyperlink;
 use std::path::Path;
+use tokio::fs;
 use tracing::info;
 
 mod config;
@@ -9,53 +10,72 @@ mod updater;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    color_eyre::install()?;
     logging::init("info");
     info!("Starting factorio mod manager");
 
-    color_eyre::install()?;
-
-    // Load or initialize the config file mod-manager.toml
     let cfg = config::load_or_init(Path::new("mod-manager.toml")).await?;
 
-    if cfg.factorio.username == "XXX" || cfg.factorio.token == "XXX" {
-        eprintln!("Please edit mod-manager.toml to set your Factorio username and token.");
-        std::process::exit(1);
-    }
+    ensure_credentials(&cfg)?;
 
-    // Link to Factorio headless server docs
-    let url = "https://wiki.factorio.com/Multiplayer#Dedicated/Headless_server";
-    let link = Hyperlink::new(url);
+    let docs_url = "https://wiki.factorio.com/Multiplayer#Dedicated/Headless_server";
+    let link = Hyperlink::new(docs_url);
 
-    // Ensure we’re in the Factorio root directory
-    let bin = Path::new("bin/x64/factorio");
-    if !bin.exists() {
-        eprintln!(
+    // Factorio binary must exist
+    ensure_path_exists("bin/x64/factorio", || {
+        format!(
             "factorio not found — run me from the Factorio root directory. \
-             If you do not have Factorio headless server downloaded learn how to do so \
-             and configure it properly here {}{}{}.",
-            link, url, link
-        );
-        std::process::exit(1);
-    }
+             If you do not have the headless server, see {}{}{}.",
+            link, docs_url, link
+        )
+    })
+    .await?;
 
-    // Ensure the data directory exists
-    let data_dir = Path::new("data");
-    if !data_dir.is_dir() {
-        eprintln!("data directory missing — please run the Factorio server at least once");
-        std::process::exit(1);
-    }
+    // Data directory must be present
+    ensure_path_is_dir("data", || {
+        "data directory missing — please run the Factorio server at least once".to_string()
+    })
+    .await?;
 
-    // Delete leftover temp directory if it exists
-    let temp_dir = Path::new("temp");
-    if temp_dir.exists() {
-        if let Err(e) = tokio::fs::remove_dir_all(temp_dir).await {
-            eprintln!("Failed to clean up temp directory: {}", e);
-        }
-    }
+    cleanup_temp_dir("temp").await;
 
-    // Dispatch the async updater
-    updater::check_update::check_mod_updates(data_dir, &cfg).await?;
+    // Check for mod updates
+    updater::check_update::check_mod_updates(Path::new("data"), &cfg).await?;
 
     info!("Shutting down");
     Ok(())
+}
+
+fn ensure_credentials(cfg: &config::Config) -> Result<()> {
+    if cfg.factorio.username == "XXX" || cfg.factorio.token == "XXX" {
+        bail!("Please edit mod-manager.toml to set your Factorio username and token.");
+    }
+    Ok(())
+}
+
+async fn ensure_path_exists<F>(path: &str, err_msg: F) -> Result<()>
+where
+    F: FnOnce() -> String,
+{
+    fs::metadata(path).await.map_err(|_| eyre!(err_msg()))?;
+    Ok(())
+}
+
+async fn ensure_path_is_dir<F>(path: &str, err_msg: F) -> Result<()>
+where
+    F: Fn() -> String,
+{
+    let md = fs::metadata(path).await.map_err(|_| eyre!(err_msg()))?;
+    if !md.is_dir() {
+        bail!(err_msg());
+    }
+    Ok(())
+}
+
+async fn cleanup_temp_dir(path: &str) {
+    if fs::metadata(path).await.is_ok() {
+        if let Err(e) = fs::remove_dir_all(path).await {
+            tracing::warn!("Failed to clean up temp directory `{}`: {:?}", path, e);
+        }
+    }
 }

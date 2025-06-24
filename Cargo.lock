@@ -316,6 +316,7 @@ dependencies = [
 name = "factorio-server-manager"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "color-eyre",
  "osc8",
  "reqwest",

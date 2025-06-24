@@ -1,13 +1,16 @@
 use color_eyre::eyre::{Result, eyre};
-use reqwest::Url;
+use reqwest::{Client, Url};
 use sha1::{Digest, Sha1};
-use std::io::Cursor;
-use std::path::Path;
-use tokio::fs;
+use std::{
+    io::Cursor,
+    path::{Path, PathBuf},
+};
+use tokio::{fs, task};
 use tracing::{debug, error, info};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
+/// Downloads, verifies, and installs a Factorio mod.
 pub async fn update_mod(
     name: &str,
     download_url: &str,
@@ -15,133 +18,143 @@ pub async fn update_mod(
     username: &str,
     token: &str,
 ) -> Result<()> {
-    info!("Beginning update for mod '{}'", name);
+    info!("Starting update for mod '{}'", name);
 
-    // Ensure the data/ directory exists
+    ensure_data_dir().await?;
+    let url = build_download_url(download_url, username, token)?;
+
+    info!("Downloading '{}' from {}", name, url);
+    let bytes = download_zip(&url).await?;
+
+    verify_sha(&bytes[..], expected_sha, name)?;
+
+    let temp_dir = prepare_temp_dir().await?;
+    extract_zip(bytes, &temp_dir)?;
+
+    let extracted_root = find_extracted_root(&temp_dir, name)?;
+    let neat = derive_neat_name(&extracted_root, name)?;
+
+    clean_old_versions(&neat).await?;
+    install_new_mod(&extracted_root, &neat).await?;
+    cleanup_temp(&temp_dir).await?;
+
+    info!("Mod '{}' installed as '{}'", name, neat);
+    Ok(())
+}
+
+async fn ensure_data_dir() -> Result<()> {
     let data_dir = Path::new("data");
-    info!("Ensuring data directory exists at {:?}", data_dir);
     fs::create_dir_all(data_dir).await?;
+    Ok(())
+}
 
-    // Build URL with authentication
-    let base = if download_url.starts_with("http") {
-        download_url.to_string()
+fn build_download_url(raw_url: &str, user: &str, token: &str) -> Result<Url> {
+    let base = if raw_url.starts_with("http") {
+        raw_url.to_string()
     } else {
-        format!("https://mods.factorio.com/{}", download_url)
+        format!("https://mods.factorio.com/{}", raw_url)
     };
-    debug!("Base download URL: {}", base);
-
-    let mut url = Url::parse(&base)
-        .map_err(|e| eyre!("Invalid download URL for {}: {}: {}", name, download_url, e))?;
+    let mut url =
+        Url::parse(&base).map_err(|e| eyre!("Invalid download URL '{}': {}", raw_url, e))?;
     {
         let mut qp = url.query_pairs_mut();
-        qp.append_pair("username", username);
+        qp.append_pair("username", user);
         qp.append_pair("token", token);
     }
-    info!("Downloading '{}' from {}", name, url);
+    Ok(url)
+}
 
-    // Download ZIP into memory
-    let resp = reqwest::get(url.clone()).await?;
+async fn download_zip(url: &Url) -> Result<bytes::Bytes> {
+    let resp = Client::new().get(url.clone()).send().await?;
     if !resp.status().is_success() {
-        error!(
-            "Failed to download '{}': HTTP {} at {}",
-            name,
-            resp.status(),
-            resp.url()
-        );
-        return Err(eyre!(
-            "Failed to download {}: HTTP {} at {}",
-            name,
-            resp.status(),
-            resp.url()
-        ));
+        error!("HTTP {} at {}", resp.status(), resp.url());
+        return Err(eyre!("Download failed: HTTP {}", resp.status()));
     }
     let bytes = resp.bytes().await?;
-    debug!("Downloaded {} bytes for '{}'", bytes.len(), name);
+    debug!("Downloaded {} bytes", bytes.len());
+    Ok(bytes)
+}
 
-    // SHA-1 check
+fn verify_sha(bytes: &[u8], expected: &str, name: &str) -> Result<()> {
     let mut hasher = Sha1::new();
-    hasher.update(&bytes);
-    let got_sha = format!("{:x}", hasher.finalize());
-    debug!("Computed SHA1 for '{}': {}", name, got_sha);
-    if got_sha != expected_sha {
+    hasher.update(bytes);
+    let got = format!("{:x}", hasher.finalize());
+    debug!("SHA1 for '{}': {}", name, got);
+    if got != expected {
         error!(
-            "SHA1 mismatch for '{}': expected {}, got {}",
-            name, expected_sha, got_sha
+            "SHA mismatch for '{}': expected {}, got {}",
+            name, expected, got
         );
-        return Err(eyre!(
-            "SHA1 mismatch for {}: expected {}, got {}",
-            name,
-            expected_sha,
-            got_sha
-        ));
+        return Err(eyre!("SHA mismatch for {}", name));
     }
-    info!("SHA1 verified for '{}'", name);
+    Ok(())
+}
 
-    // In-memory unzip into temp/
-    let temp_dir = Path::new("temp");
-    if temp_dir.exists() {
-        info!("Cleaning up existing temp directory at {:?}", temp_dir);
-        fs::remove_dir_all(temp_dir).await?;
+async fn prepare_temp_dir() -> Result<PathBuf> {
+    let temp = PathBuf::from("temp");
+    if fs::metadata(&temp).await.is_ok() {
+        fs::remove_dir_all(&temp).await?;
     }
-    fs::create_dir_all(temp_dir).await?;
-    info!("Extracting archive into {:?}", temp_dir);
+    fs::create_dir_all(&temp).await?;
+    Ok(temp)
+}
 
-    let reader = Cursor::new(bytes);
-    let mut archive =
-        ZipArchive::new(reader).map_err(|e| eyre!("Failed to read ZIP for {}: {}", name, e))?;
-    archive
-        .extract(temp_dir)
-        .map_err(|e| eyre!("Failed to extract {}: {}", name, e))?;
-    info!("Extraction complete for '{}'", name);
+fn extract_zip(bytes: bytes::Bytes, temp: &Path) -> Result<()> {
+    // Extraction can block, so run in a blocking task.
+    task::block_in_place(|| {
+        let reader = Cursor::new(bytes);
+        let mut archive =
+            ZipArchive::new(reader).map_err(|e| eyre!("Failed to read zip: {}", e))?;
+        archive
+            .extract(temp)
+            .map_err(|e| eyre!("Failed to extract zip: {}", e))
+    })?;
+    info!("Extracted archive to '{:?}'", temp);
+    Ok(())
+}
 
-    // Find the folder that contains info.json
-    let extracted_root = WalkDir::new(temp_dir)
+fn find_extracted_root(temp: &Path, name: &str) -> Result<PathBuf> {
+    WalkDir::new(temp)
         .into_iter()
         .filter_map(|e| e.ok())
         .find(|e| e.file_name() == "info.json")
-        .and_then(|e| e.path().parent().map(std::path::PathBuf::from))
-        .ok_or_else(|| {
-            error!("Could not find info.json in ZIP for '{}'", name);
-            eyre!("Could not find info.json in ZIP for {}", name)
-        })?;
-    debug!("Located extracted root directory: {:?}", extracted_root);
+        .and_then(|e| e.path().parent().map(PathBuf::from))
+        .ok_or_else(|| eyre!("Missing info.json in archive for {}", name))
+}
 
-    // Derive the neat folder name
-    let raw = extracted_root
+fn derive_neat_name(extracted: &Path, name: &str) -> Result<String> {
+    let raw = extracted
         .file_name()
         .and_then(|os| os.to_str())
-        .ok_or_else(|| {
-            error!("Bad folder name in ZIP for '{}'", name);
-            eyre!("Bad folder name in ZIP for {}", name)
-        })?;
+        .ok_or_else(|| eyre!("Bad folder name for {}", name))?;
     let neat = raw.trim_end_matches(".zip");
-    info!("Preparing install folder name: '{}'", neat);
+    Ok(neat.to_string())
+}
 
-    // Remove any old versions for this mod
-    let slug = neat.split_once('_').map_or(neat, |(first, _)| first);
-    info!("Cleaning up old versions for slug '{}'", slug);
-    let mut entries = fs::read_dir(data_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let ty = entry.file_type().await?;
+async fn clean_old_versions(neat: &str) -> Result<()> {
+    let slug = neat.split_once('_').map_or(neat, |(s, _)| s);
+    let mut entries = fs::read_dir("data").await?;
+    while let Some(ent) = entries.next_entry().await? {
+        let ty = ent.file_type().await?;
         if ty.is_dir() {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if fname.starts_with(&format!("{}_", slug)) && fname != neat {
-                let old_path = entry.path();
-                info!("Removing old version directory {:?}", old_path);
-                fs::remove_dir_all(old_path).await?;
+            let fname = ent.file_name().to_string_lossy().to_string();
+            if fname.starts_with(slug) && fname != neat {
+                let old = ent.path();
+                info!("Removing old version '{:?}'", old);
+                fs::remove_dir_all(old).await?;
             }
         }
     }
+    Ok(())
+}
 
-    // Move the extracted folder into data/{neat}
-    let dest = data_dir.join(neat);
-    info!("Moving '{}' to {:?}", name, dest);
-    fs::rename(&extracted_root, &dest).await?;
+async fn install_new_mod(src: &Path, neat: &str) -> Result<()> {
+    let dest = Path::new("data").join(neat);
+    fs::rename(src, &dest).await?;
+    Ok(())
+}
 
-    // Cleanup temp files
-    info!("Removing temp directory at {:?}", temp_dir);
-    fs::remove_dir_all(temp_dir).await?;
-
-    info!("Mod '{}' updated successfully → {}", name, neat);
+async fn cleanup_temp(temp: &Path) -> Result<()> {
+    fs::remove_dir_all(temp).await?;
     Ok(())
 }
