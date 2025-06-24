@@ -5,11 +5,17 @@ use tokio::fs;
 use toml::{Value, map::Map};
 use tracing::{debug, info, warn};
 
-const ALLOWED_KEYS: &[&str] = &["username", "token"];
-const ALLOWED_MOD_MANAGER_KEYS: &[&str] = &[
-    "autoupdate-mods",
-    "autoupdate-server",
-    "autostart-when-finished",
+// Allowed keys per top-level section
+const ALLOWED_SECTION_KEYS: &[(&str, &[&str])] = &[
+    ("factorio", &["username", "token"]),
+    (
+        "mod-manager",
+        &[
+            "autoupdate-mods",
+            "autoupdate-server",
+            "autostart-when-finished",
+        ],
+    ),
 ];
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -69,7 +75,7 @@ async fn create_default(path: &Path) -> Result<Config> {
     info!("Config not found, writing default to {:?}", path);
     let cfg = Config::default();
     let toml_str = toml::to_string_pretty(&cfg)?;
-    fs::write(path, toml_str).await?;
+    fs::write(path, &toml_str).await?;
     Ok(cfg)
 }
 
@@ -83,11 +89,20 @@ async fn sanitize_existing(path: &Path) -> Result<Config> {
         .as_table_mut()
         .ok_or_else(|| eyre!("Expected root table in {:?}, overwriting", path))?;
 
-    sanitize_factorio_section(table);
-    sanitize_mod_manager_section(table);
+    let default_cfg = Config::default();
+    // Sanitize each known section
+    for &(section, allowed_keys) in ALLOWED_SECTION_KEYS {
+        // Generate the default section as a TOML Value
+        let default_section = match section {
+            "factorio" => toml::Value::try_from(&default_cfg.factorio).unwrap(),
+            "mod-manager" => toml::Value::try_from(&default_cfg.mod_manager).unwrap(),
+            _ => unreachable!(),
+        };
+        sanitize_section(table, section, allowed_keys, default_section);
+    }
 
     let new_toml = toml::to_string_pretty(&doc)?;
-    fs::write(path, new_toml.clone()).await?;
+    fs::write(path, &new_toml).await?;
     info!("Sanitized config written back to {:?}", path);
 
     let cfg: Config = toml::from_str(&new_toml)?;
@@ -95,79 +110,47 @@ async fn sanitize_existing(path: &Path) -> Result<Config> {
     Ok(cfg)
 }
 
-fn sanitize_factorio_section(root: &mut Map<String, Value>) {
-    // Prepare a default FactorioConfig as TOML Value
-    let default_section: Value = toml::from_str(
-        &toml::to_string(&Config::default().factorio).expect("default factorio always serializes"),
-    )
-    .expect("default factorio always deserializes");
-
-    // Ensure we have a table under "factorio"
+/// Ensure a section table only contains allowed keys and has all required keys.
+fn sanitize_section(
+    root: &mut Map<String, Value>,
+    section: &str,
+    allowed_keys: &[&str],
+    default_section: Value,
+) {
     let entry = root
-        .entry("factorio")
+        .entry(section)
         .or_insert_with(|| default_section.clone());
-
-    if let Value::Table(map) = entry {
-        // Remove any keys not in our allow-list
-        for key in map.keys().cloned().collect::<Vec<_>>() {
-            if !ALLOWED_KEYS.contains(&key.as_str()) {
-                debug!("Removing disallowed key '{}' from config", key);
+    match entry {
+        Value::Table(map) => {
+            // Remove disallowed keys
+            let to_remove: Vec<_> = map
+                .keys()
+                .filter(|k| !allowed_keys.contains(&k.as_str()))
+                .cloned()
+                .collect();
+            for key in to_remove {
+                debug!("Removing disallowed key '{}' from '{}'", key, section);
                 map.remove(&key);
             }
-        }
-        // Ensure username & token exist
-        for &key in ALLOWED_KEYS {
-            if !map.contains_key(key) {
-                warn!("Missing '{}' in config, inserting default", key);
-                if let Some(default_val) = default_section.get(key) {
-                    map.insert(key.into(), default_val.clone());
+            // Ensure required keys exist
+            for &key in allowed_keys {
+                if !map.contains_key(key) {
+                    warn!(
+                        "Missing '{}' in '{}' config, inserting default",
+                        key, section
+                    );
+                    if let Some(default_val) = default_section.get(key) {
+                        map.insert(key.into(), default_val.clone());
+                    }
                 }
             }
         }
-    } else {
-        warn!(
-            "'factorio' was not a table (got {:?}), resetting to default",
-            entry
-        );
-        *entry = default_section;
-    }
-}
-
-fn sanitize_mod_manager_section(root: &mut Map<String, Value>) {
-    // Prepare a default ModManagerConfig as TOML Value
-    let default_section: Value = toml::from_str(
-        &toml::to_string(&Config::default().mod_manager)
-            .expect("default mod-manager always serializes"),
-    )
-    .expect("default mod-manager always deserializes");
-
-    // Ensure we have a table under "mod-manager"
-    let entry = root
-        .entry("mod-manager")
-        .or_insert_with(|| default_section.clone());
-
-    if let Value::Table(map) = entry {
-        // Remove any keys not in our allow-list
-        for key in map.keys().cloned().collect::<Vec<_>>() {
-            if !ALLOWED_MOD_MANAGER_KEYS.contains(&key.as_str()) {
-                debug!("Removing disallowed key '{}' from mod-manager config", key);
-                map.remove(&key);
-            }
+        _ => {
+            warn!(
+                "'{}' was not a table (got {:?}), resetting to default",
+                section, entry
+            );
+            *entry = default_section;
         }
-        // Ensure all mod-manager keys exist
-        for &key in ALLOWED_MOD_MANAGER_KEYS {
-            if !map.contains_key(key) {
-                warn!("Missing '{}' in mod-manager config, inserting default", key);
-                if let Some(default_val) = default_section.get(key) {
-                    map.insert(key.into(), default_val.clone());
-                }
-            }
-        }
-    } else {
-        warn!(
-            "'mod-manager' was not a table (got {:?}), resetting to default",
-            entry
-        );
-        *entry = default_section;
     }
 }
