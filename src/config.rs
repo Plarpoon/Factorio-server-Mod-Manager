@@ -5,7 +5,6 @@ use tokio::fs;
 use toml::{Value, map::Map};
 use tracing::{debug, info, warn};
 
-// Allowed keys per top-level section
 const ALLOWED_SECTION_KEYS: &[(&str, &[&str])] = &[
     ("factorio", &["username", "token"]),
     (

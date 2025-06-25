@@ -23,3 +23,7 @@ tracing-subscriber = { version = "0.3.19", features = [
 ] }
 walkdir = "2.5.0"
 zip = "4.2.0"
+
+[dependencies.openssl]
+version = "0.10.73"
+features = ["vendored"]

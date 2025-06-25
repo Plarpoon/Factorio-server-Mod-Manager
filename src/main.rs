@@ -16,8 +16,6 @@ async fn main() -> Result<()> {
 
     let cfg = config::load_or_init(Path::new("mod-manager.toml")).await?;
 
-    ensure_credentials(&cfg)?;
-
     let docs_url = "https://wiki.factorio.com/Multiplayer#Dedicated/Headless_server";
     let link = Hyperlink::new(docs_url);
 
@@ -31,25 +29,19 @@ async fn main() -> Result<()> {
     })
     .await?;
 
-    // Data directory must be present
+    // Data directory must be present and be a directory
     ensure_path_is_dir("data", || {
-        "data directory missing — please run the Factorio server at least once".to_string()
+        "data directory missing or not a directory — please run the Factorio server at least once".to_string()
     })
     .await?;
 
+    // If old temp directory exists, delete it
     cleanup_temp_dir("temp").await;
 
     // Check for mod updates
     updater::check_update::check_mod_updates(Path::new("data"), &cfg).await?;
 
-    info!("Shutting down");
-    Ok(())
-}
-
-fn ensure_credentials(cfg: &config::Config) -> Result<()> {
-    if cfg.factorio.username == "XXX" || cfg.factorio.token == "XXX" {
-        bail!("Please edit mod-manager.toml to set your Factorio username and token.");
-    }
+    info!("Terminating factorio mod manager");
     Ok(())
 }
 
